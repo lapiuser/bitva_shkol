@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#f6f2eb" />
+  <meta name="description" content="БИТВА ШКОЛ — честный интерактивный рейтинг учебных заведений России." />
+  <meta property="og:title" content="БИТВА ШКОЛ" />
+  <meta property="og:description" content="Честный рейтинг школ и учебных заведений России." />
+  <meta property="og:type" content="website" />
+  <link rel="icon" type="image/png" href="/assets/branding/icons/logo.png" />
+  <title>БИТВА ШКОЛ</title>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" defer></script>
+  <link rel="preload" as="image" href="/assets/branding/icons/logo.png" />
+  <link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+  <div id="app">
+    <section id="selectionView" class="view view-selection">
+      <div class="selection-tools"><button id="accountBtn" class="light-tool" type="button"><img src="/assets/branding/icons/usericon.png" alt="" /> Аккаунт</button></div>
+      <div class="selection-shell">
+        <header class="brand-block">
+          <img class="brand-logo" src="/assets/branding/icons/logo.png" alt="БИТВА ШКОЛ" />
+          <div class="brand-copy">
+            <div class="eyebrow"><img src="/assets/branding/icons/russia.png" alt="" /> РОССИЯ</div>
+            <h1>БИТВА<br class="desktop-only" /> ШКОЛ</h1>
+            <p>Выберите город и учебное заведение — затем поддерживайте его кликами.</p>
+          </div>
+        </header>
+
+        <div class="selection-path" aria-label="Путь выбора">
+          <button id="pathRegion" class="path-chip active">Россия</button>
+          <span>›</span>
+          <button id="pathCity" class="path-chip" disabled>Город</button>
+          <span>›</span>
+          <button id="pathCategory" class="path-chip" disabled>Категория</button>
+        </div>
+
+        <section id="homeLeaderboard" class="home-leaderboard">
+          <div class="home-leader-head"><div><span class="sheet-kicker">РЕЙТИНГ</span><h2 id="homeLeaderboardTitle">Лидирующие школы</h2></div><div class="leaderboard-tabs"><button id="homeSchoolsBtn" class="rank-tab active">Школы</button><button id="homeCitiesBtn" class="rank-tab">Города</button></div></div>
+          <div id="homeLeaderboardList" class="leaderboard-list"></div>
+        </section>
+        <div id="categoryGrid" class="category-grid"></div>
+        <button id="rememberedSchoolBtn" class="secondary-button hidden"></button>
+      </div>
+    </section>
+
+    <section id="schoolView" class="view view-school hidden">
+      <div class="backdrop" id="backdrop"></div>
+      <header class="topbar">
+        <button id="changeSchoolBtn" class="icon-button" aria-label="Сменить учебное заведение">←</button>
+        <div class="topbar-brand">
+          <img src="/assets/branding/icons/logo.png" alt="" />
+          <div>
+            <strong>БИТВА ШКОЛ</strong>
+            <span id="categoryLabel">—</span>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <button id="accountBtnSchool" class="icon-button" aria-label="Аккаунт"><img src="/assets/branding/icons/usericon.png" alt="" /></button>
+          <button id="aboutBtn" class="icon-button" aria-label="О проекте">
+            <img src="/assets/branding/icons/statistick.png" alt="" />
+          </button>
+        </div>
+      </header>
+
+      <main class="hero-wrap">
+        <div class="hero-card" id="heroClickArea" role="button" aria-label="Нажимайте, чтобы поддержать">
+          <picture class="hero-picture">
+            <source id="heroMobileSource" media="(max-width: 700px)" />
+            <img id="heroImage" alt="" fetchpriority="high" decoding="async" />
+          </picture>
+          <div class="hero-shade"></div>
+          <div class="hero-copy">
+            <span class="hero-kicker" id="heroLocation">РОССИЯ · —</span>
+            <h2 id="schoolName">—</h2>
+            <div id="counterPill" class="counter-pill">
+              <span>Твои клики за минуту</span>
+              <strong id="sessionClicks">0</strong>
+            </div>
+          </div>
+          <div id="floatLayer" class="float-layer" aria-hidden="true"></div>
+          <div class="click-hint">Нажимай</div>
+          <div id="clickLocked" class="click-locked hidden">Сначала пройди проверку</div>
+        </div>
+      </main>
+
+      <div id="leaderboardDelta" class="leaderboard-delta" aria-live="polite"></div>
+
+      <section class="bottom-dock">
+        <button id="leaderboardToggle" class="leader-dock" aria-expanded="false">
+          <div class="leader-icon-wrap"><img src="/assets/branding/icons/leaderboard.png" alt="" /></div>
+          <div class="leader-summary">
+            <span>ЛИДЕР</span>
+            <strong id="leaderName">—</strong>
+            <small><span id="leaderClicks">0</span> кликов</small>
+          </div>
+          <div class="my-rank">
+            <span>ТВОЁ МЕСТО</span>
+            <strong id="myRank">—</strong>
+          </div>
+          <span class="chevron">⌃</span>
+        </button>
+      </section>
+
+      <aside id="leaderboardSheet" class="sheet" aria-hidden="true">
+        <div class="sheet-backdrop" data-close="leaderboard"></div>
+        <div class="sheet-panel">
+          <div class="sheet-head">
+            <div>
+              <span class="sheet-kicker">РЕЙТИНГ</span>
+              <h3 id="leaderboardTitle">Кто сейчас впереди</h3>
+              <p id="leaderboardSubtitle" class="sheet-subtitle">Школы соревнуются по реальным засчитанным кликам.</p>
+              <div class="leaderboard-tabs" role="tablist" aria-label="Тип рейтинга">
+                <button id="rankSchoolsBtn" class="rank-tab active" role="tab" aria-selected="true">Школы</button>
+                <button id="rankCitiesBtn" class="rank-tab" role="tab" aria-selected="false">Города</button>
+                <button id="rankCitySchoolsBtn" class="rank-tab" role="tab" aria-selected="false">Школы города</button>
+              </div>
+            </div>
+            <button class="close-button" data-close="leaderboard" aria-label="Закрыть">×</button>
+          </div>
+          <div id="leaderboardList" class="leaderboard-list"></div>
+        </div>
+      </aside>
+
+      <aside id="aboutSheet" class="sheet" aria-hidden="true">
+        <div class="sheet-backdrop" data-close="about"></div>
+        <div class="sheet-panel about-panel">
+          <div class="sheet-head">
+            <div>
+              <span class="sheet-kicker">БИТВА ШКОЛ</span>
+              <h3 id="aboutTitle">О проекте</h3>
+            </div>
+            <button class="close-button" data-close="about" aria-label="Закрыть">×</button>
+          </div>
+          <p id="aboutText" class="about-text">Загрузка…</p>
+          <div class="author-block">
+            <div class="eyebrow">СЛОВА АВТОРА</div>
+            <p id="authorWords">Загрузка…</p>
+            <a id="adminLink" class="production-link" href="/admin">Anton Ljungberg Production</a>
+            <button id="uploadPhotoBtn" class="contact-school-link" type="button">Загрузить фотографию школы →</button>
+          </div>
+          <div class="support-row">
+            <div>
+              <strong>Поддержать проект</strong>
+              <span>Ссылка на донейшен настраивается при запуске.</span>
+            </div>
+            <a id="donationBtn" class="support-button" href="#" target="_blank" rel="noopener noreferrer">Поддержать</a>
+          </div>
+          <div class="stats-grid">
+            <div class="stat-card"><span class="stat-label">Всего посетителей</span><strong id="statUsers">0</strong></div>
+            <div class="stat-card"><span class="stat-label">Сейчас на сайте</span><strong id="statActive">0</strong></div>
+            <div class="stat-card"><span class="stat-label">Всего кликов</span><strong id="statClicks">0</strong></div>
+            <div class="stat-card"><span class="stat-label">Школ играет</span><strong id="statSchools">0</strong></div>
+            <div class="stat-card rate-card">
+              <div class="rate-head"><span class="stat-label">Клики/с · 5 секунд</span><strong><span id="statCps">0</span></strong></div>
+              <div id="cpsChart" class="cps-chart" aria-label="График кликов за последние пять секунд"></div>
+              <span id="cpsAverage" class="rate-average">Среднее: 0/с</span>
+            </div>
+          </div>
+          <p class="data-note">Рейтинг и статистика обновляются автоматически. График показывает последние 5 секунд.</p>
+        </div>
+      </aside>
+    </section>
+  </div>
+
+  <aside id="photoSheet" class="sheet" aria-hidden="true">
+    <div class="sheet-backdrop" data-close="photo"></div>
+    <div class="sheet-panel account-panel">
+      <div class="sheet-head"><div><span class="sheet-kicker">ФОТОГРАФИЯ</span><h3>Загрузить фото школы</h3><p class="sheet-subtitle">Фото сначала проверяет администратор.</p></div><button class="close-button" data-close="photo" aria-label="Закрыть">×</button></div>
+      <form id="photoUploadForm" class="account-form">
+        <label>Страна<select id="photoCountry" required></select></label>
+        <label>Город<select id="photoCity" required></select></label>
+        <label>Школа<select id="photoSchool" required></select></label>
+        <label>Фотография<input id="photoFile" type="file" accept="image/jpeg,image/png,image/webp" required /></label>
+        <label class="consent-check"><input id="photoConsent" type="checkbox" required /> <span>Я подтверждаю, что имею право передавать эту фотографию, согласен(на) с правилами проекта и понимаю, что фото публикуется только после проверки администрацией. Я не передаю чужие персональные данные и изображения без разрешения. <a href="/privacy" target="_blank" rel="noopener">Правила и конфиденциальность</a>.</span></label>
+        <button class="primary account-submit" type="submit">Отправить на модерацию</button>
+        <p id="photoUploadStatus" class="account-status"></p>
+      </form>
+    </div>
+  </aside>
+
+  <aside id="accountSheet" class="sheet" aria-hidden="true">
+    <div class="sheet-backdrop" data-close="account"></div>
+    <div class="sheet-panel account-panel">
+      <div class="sheet-head">
+        <div>
+          <span class="sheet-kicker">АККАУНТ</span>
+          <h3>Вход и регистрация</h3>
+          <p class="sheet-subtitle">Регистрация начинается с username и пароля. Telegram подтверждается отдельным кодом.</p>
+        </div>
+        <button class="close-button" data-close="account" aria-label="Закрыть">×</button>
+      </div>
+      <div id="accountLoggedIn" class="account-logged hidden">
+        <div class="account-status-card"><span>Вы вошли как</span><strong id="accountLoggedUser">—</strong><b id="accountMultiplier">×1 к лимиту</b></div>
+        <div class="account-stat-grid">
+          <div><span>Всего кликов</span><strong id="accountTotalClicks">0</strong></div>
+          <div><span>Любимая школа</span><strong id="accountFavoriteSchool">—</strong><small id="accountFavoriteSchoolMeta">Пока нет кликов</small></div>
+        </div>
+        <p id="accountSubscriptionText" class="account-note">—</p>
+        <button id="accountLogoutBtn" class="secondary-button" type="button">Выйти</button>
+      </div>
+      <div id="accountAuth">
+        <div class="account-tabs">
+          <button id="accountLoginTab" class="account-tab active" type="button">Вход</button>
+          <button id="accountRegisterTab" class="account-tab" type="button">Регистрация</button>
+        </div>
+        <form id="accountLoginForm" class="account-form">
+          <label>Telegram username<input id="accountLoginUsername" placeholder="@username" autocomplete="username" required /></label>
+          <label>Пароль<input id="accountLoginPassword" type="password" autocomplete="current-password" required /></label>
+          <button class="primary account-submit" type="submit">Войти</button>
+        </form>
+        <form id="accountRegisterForm" class="account-form hidden">
+          <div class="account-help">1. Введите username и пароль<br>2. Нажмите «Сгенерировать код»<br>3. Откройте Telegram-бота и отправьте код (кнопка сама откроет бота с ним)<br>4. После подтверждения регистрация разблокируется</div>
+          <label>Telegram username<input id="accountRegisterUsername" placeholder="@username" autocomplete="username" required /></label>
+          <label>Придумайте пароль<input id="accountRegisterPassword" type="password" minlength="8" autocomplete="new-password" required /></label>
+          <button id="verificationStartBtn" class="secondary-button" type="button">Сгенерировать код</button>
+          <div id="verificationBox" class="verification-box hidden">
+            <div class="verification-code-row"><code id="verificationCode">--------</code><button id="copyVerificationCodeBtn" class="mini-copy" type="button">Копировать</button></div>
+            <a id="accountBotLink" class="bot-button disabled" href="#" target="_blank" rel="noopener noreferrer">Открыть бота с кодом</a>
+            <button id="verificationCheckBtn" class="secondary-button" type="button">Проверить подтверждение</button>
+            <p id="verificationStatus" class="verification-status"></p>
+          </div>
+          <button id="verificationRegisterBtn" class="primary account-submit" type="submit" disabled>Создать аккаунт</button>
+        </form>
+        <p id="accountStatus" class="account-status"></p>
+      </div>
+    </div>
+  </aside>
+
+  <div id="eventFxLayer" class="event-fx-layer" aria-hidden="true"></div>
+  <div id="gameEventBanner" class="game-event-banner" aria-live="polite"><strong id="gameEventTitle"></strong><span id="gameEventMeta"></span></div>
+
+  <div id="turnstileWidget" class="turnstile-invisible" aria-hidden="true"></div>
+  <div id="globalNotice" class="global-notice" aria-live="assertive" aria-hidden="true"><div id="globalNoticeText"></div></div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/app.js?v=8" defer></script>
+</body>
+</html>

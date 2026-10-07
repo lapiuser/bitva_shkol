@@ -1,0 +1,681 @@
+
+def iso_utc(value: datetime) -> str:
+    return value.replace(tzinfo=timezone.utc).isoformat()
+
+
+def bot_url() -> str:
+    username = telegram_bot.BOT_USERNAME_RUNTIME or os.getenv("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@")
+    configured = TELEGRAM_BOT_URL.strip()
+    if configured:
+        return configured
+    return f"https://t.me/{username}" if username else ""
+
+
+def school_payload(row: School, include_image: bool = True) -> dict:
+    result = {
+        "id": row.id,
+        "name": row.name,
+        "category": row.category,
+        "category_label": row.category_label,
+        "country": row.country,
+        "region": row.region or "",
+        "city": row.city,
+    }
+    result["clicks"] = int(row.real_clicks + row.artificial_clicks)
+    if include_image:
+        result["images"] = asset_paths(row)
+    return result
+
+
+class ClickPayload(BaseModel):
+    school_id: str = Field(min_length=1, max_length=100)
+    clicks: int = Field(ge=1, le=CLICK_LIMIT_PER_MINUTE * VERIFIED_MULTIPLIER)
+    request_id: str = Field(min_length=16, max_length=80)
+
+
+class HeartbeatPayload(BaseModel):
+    school_id: str | None = None
+
+
+class CaptchaPayload(BaseModel):
+    token: str = Field(min_length=1, max_length=2048)
+
+
+class AdminLoginPayload(BaseModel):
+    username: str = Field(min_length=1, max_length=80)
+    password: str = Field(min_length=1, max_length=200)
+    captcha_token: str | None = Field(default=None, max_length=2048)
+
+
+class BlockPayload(BaseModel):
+    identity_hash: str = Field(min_length=32, max_length=64)
+    reason: str = Field(default="", max_length=500)
+
+
+class AccountRegisterPayload(BaseModel):
+    telegram_username: str = Field(min_length=2, max_length=80)
+    password: str = Field(min_length=8, max_length=128)
+    code: str = Field(min_length=8, max_length=16)
+
+
+class AccountLoginPayload(BaseModel):
+    telegram_username: str = Field(min_length=2, max_length=80)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class NoticePayload(BaseModel):
+    text: str = Field(min_length=1, max_length=MAX_NOTICE_CHARS)
+
+
+class VerificationStartPayload(BaseModel):
+    telegram_username: str = Field(min_length=2, max_length=80)
+
+
+class VerificationStatusPayload(BaseModel):
+    code: str = Field(min_length=8, max_length=16)
+
+
+class SiteSettingsPayload(BaseModel):
+    about_text: str = Field(min_length=1, max_length=5000)
+    author_words: str = Field(min_length=1, max_length=5000)
+    donation_url: str = Field(min_length=1, max_length=500)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    await telegram_bot.start_bot()
+    yield
+    await telegram_bot.stop_bot()
+
+
+app = FastAPI(title="БИТВА ШКОЛ", version="4.0.0", lifespan=lifespan)
+app.mount("/assets", StaticFiles(directory=str(STATIC_DIR)), name="assets")
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/assets/uploads/"):
+        response.headers["Cache-Control"] = "public, max-age=86400"
+    elif path.startswith("/assets/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    elif path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    return response
+
+
+@app.get("/api/config")
+def public_config():
+    return {
+        "site_name": "БИТВА ШКОЛ",
+        "captcha_enabled": TURNSTILE_ENABLED,
+        "turnstile_site_key": TURNSTILE_SITE_KEY if TURNSTILE_ENABLED else "",
+        "turnstile_mode": TURNSTILE_MODE,
+        "donation_url": setting_value("donation_url", DONATION_URL),
+        "stats_refresh_seconds": STATS_REFRESH_SECONDS,
+        "rating_refresh_seconds": RATING_REFRESH_SECONDS,
+        "click_limit_per_minute": CLICK_LIMIT_PER_MINUTE,
+        "click_max_per_request": CLICK_LIMIT_PER_MINUTE * VERIFIED_MULTIPLIER,
+        "verified_multiplier": VERIFIED_MULTIPLIER,
+        "telegram_channel_url": f"https://t.me/{TELEGRAM_CHANNEL_USERNAME.lstrip('@')}",
+        "telegram_bot_url": bot_url(),
+        "storage": "postgres" if not str(DATABASE_URL).startswith("sqlite") else "sqlite",
+    }
+
+
+@app.get("/api/session")
+def session(response: Response, request: Request):
+    identity, prefix, ua_hash = ensure_identity(request, response)
+    now = utcnow()
+    with SessionLocal() as db:
+        account = user_session_account(db, request.cookies.get(USER_COOKIE))
+        minute_limit, _, _, _ = effective_limits(account)
+        if blocked(db, identity):
+            return {
+                "ok": True, "visitor": identity[:12], "clicks_minute": 0, "remaining": 0,
+                "limit_per_minute": minute_limit, "captcha_required": TURNSTILE_ENABLED,
+                "account_authenticated": bool(account), "verified_subscriber": bool(account and account.is_subscriber),
+                "multiplier": VERIFIED_MULTIPLIER if account and account.is_subscriber else 1,
+            }
+        row = db.query(DailyVisitor).filter(DailyVisitor.day == today_key(), DailyVisitor.identity_hash == identity).first()
+        if row:
+            row.last_seen = now
+        else:
+            db.add(DailyVisitor(day=today_key(), identity_hash=identity, last_seen=now))
+        ensure_usage(db, identity, now)
+        db.commit()
+        clicks_minute = recent_clicks_for_identity(db, identity, now, 60)
+        if account:
+            stale = not account.last_subscription_check or account.last_subscription_check < now - timedelta(minutes=SUBSCRIPTION_REFRESH_MINUTES)
+        else:
+            stale = False
+    if account and stale and TELEGRAM_BOT_TOKEN:
+        try:
+            import aiohttp
+            async def refresh():
+                timeout = aiohttp.ClientTimeout(total=5)
+                async with aiohttp.ClientSession(timeout=timeout) as http:
+                    return await telegram_bot.check_subscription(http, int(account.tg_user_id))
+            # FastAPI sync endpoint is executed in a worker; use a tiny one-shot loop.
+            import asyncio
+            subscribed = asyncio.run(refresh())
+            with SessionLocal() as db:
+                live = db.get(Account, account.id)
+                if live:
+                    live.is_subscriber = 1 if subscribed else 0
+                    live.last_subscription_check = utcnow()
+                    db.commit()
+                    account = live
+        except Exception:
+            pass
+    minute_limit, _, _, _ = effective_limits(account)
+    return {
+        "ok": True,
+        "visitor": identity[:12],
+        "clicks_minute": clicks_minute,
+        "remaining": max(0, minute_limit - clicks_minute),
+        "limit_per_minute": minute_limit,
+        "captcha_required": TURNSTILE_ENABLED,
+        "account_authenticated": bool(account),
+        "telegram_username": account.telegram_username if account else "",
+        "verified_subscriber": bool(account and account.is_subscriber),
+        "multiplier": VERIFIED_MULTIPLIER if account and account.is_subscriber else 1,
+    }
+
+
+@app.post("/api/captcha/verify")
+def captcha_verify(payload: CaptchaPayload, request: Request, response: Response):
+    require_same_origin(request)
+    identity, prefix, _ = ensure_identity(request, response)
+    now = utcnow()
+    with SessionLocal() as db:
+        if blocked(db, identity):
+            raise HTTPException(status_code=403, detail="Доступ ограничен")
+        if not verify_turnstile(payload.token, client_ip(request)):
+            log_abuse(db, "invalid_captcha", identity, prefix, "Turnstile verification failed")
+            db.commit()
+            raise HTTPException(status_code=403, detail="Проверка не пройдена")
+        usage = ensure_usage(db, identity, now)
+        usage.captcha_verified_until = now + timedelta(minutes=CAPTCHA_SESSION_MINUTES)
+        db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/cities")
+def cities():
+    with SessionLocal() as db:
+        rows = db.query(School.city, func.count(School.id)).filter(School.is_active == 1).group_by(School.city).order_by(School.city.asc()).all()
+        return {"country": "Россия", "cities": [{"name": city, "count": int(count)} for city, count in rows]}
+
+
+@app.get("/api/cities/{city}/categories")
+def city_categories(city: str):
+    city = clean_text(city, 160)
+    with SessionLocal() as db:
+        rows = db.query(School).filter(School.is_active == 1, School.city == city).order_by(School.category.asc(), School.name.asc()).all()
+        grouped: dict[str, list[dict]] = {}
+        for row in rows:
+            grouped.setdefault(row.category, []).append(school_payload(row, include_image=False))
+        categories = [{"id": key, "name": CATEGORY_LABELS.get(key, key), "schools": grouped[key]} for key in CATEGORY_ORDER if key in grouped]
+        if not categories:
+            raise HTTPException(status_code=404, detail="Город не найден")
+        return {"city": city, "categories": categories}
+
+
+@app.get("/api/schools/{school_id}")
+def school_detail(school_id: str):
+    with SessionLocal() as db:
+        row = db.get(School, school_id)
+        if not row or not row.is_active:
+            raise HTTPException(status_code=404, detail="Учебное заведение не найдено")
+        return school_payload(row, include_image=True)
+
+
+@app.get("/api/leaderboard")
+def leaderboard(school_id: str | None = None, limit: int = 100, scope: str = "schools"):
+    limit = max(10, min(int(limit), 100))
+    scope = (scope or "schools").strip().lower()
+    if scope not in {"schools", "cities"}:
+        scope = "schools"
+    with SessionLocal() as db:
+        if scope == "cities":
+            rows = db.query(
+                School.city.label("city"),
+                func.coalesce(func.sum(score_expr()), 0).label("clicks"),
+                func.count(School.id).label("school_count"),
+            ).filter(School.is_active == 1).group_by(School.city).order_by(text("clicks DESC"), School.city.asc()).limit(limit).all()
+            items = [{
+                "rank": idx, "id": f"city:{row.city}", "name": row.city, "city": row.city, "region": "Россия",
+                "clicks": int(row.clicks or 0), "school_count": int(row.school_count or 0), "kind": "city",
+            } for idx, row in enumerate(rows, start=1)]
+            mine = None
+            if school_id:
+                target = db.get(School, school_id)
+                if target and target.is_active:
+                    city_sums = db.query(
+                        School.city,
+                        func.coalesce(func.sum(score_expr()), 0).label("clicks"),
+                    ).filter(School.is_active == 1).group_by(School.city).all()
+                    city_total = next((int(v or 0) for city, v in city_sums if city == target.city), 0)
+                    rank = 1 + sum(1 for city, value in city_sums if int(value or 0) > city_total or (int(value or 0) == city_total and str(city) < str(target.city)))
+                    school_count = db.query(func.count(School.id)).filter(School.is_active == 1, School.city == target.city).scalar() or 0
+                    mine = {"rank": int(rank), "id": f"city:{target.city}", "name": target.city, "city": target.city, "region": "Россия", "clicks": city_total, "school_count": int(school_count), "kind": "city"}
+            return {"scope": "cities", "items": items, "mine": mine}
+
+        rows = db.query(School).filter(School.is_active == 1).order_by(score_expr().desc(), School.id.asc()).limit(limit).all()
+        items = [{"rank": idx, "id": row.id, "name": row.name, "city": row.city, "region": row.region or "Россия", "clicks": int(row.real_clicks + row.artificial_clicks), "kind": "school"} for idx, row in enumerate(rows, start=1)]
+        mine = None
+        if school_id:
+            target = db.get(School, school_id)
+            if target and target.is_active:
+                better = db.query(func.count(School.id)).filter(School.is_active == 1, score_expr() > (target.real_clicks + target.artificial_clicks)).scalar() or 0
+                same_before = db.query(func.count(School.id)).filter(School.is_active == 1, score_expr() == (target.real_clicks + target.artificial_clicks), School.id < target.id).scalar() or 0
+                mine = {"rank": int(better + same_before + 1), "id": target.id, "name": target.name, "city": target.city, "region": target.region or "Россия", "clicks": int(target.real_clicks + target.artificial_clicks), "kind": "school"}
+        return {"scope": "schools", "items": items, "mine": mine}
+
+
+@app.get("/api/stats")
+def stats():
+    now = utcnow()
+    cutoff = now - timedelta(seconds=ACTIVE_USER_SECONDS)
+    epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    points = list(range(epoch - 4, epoch + 1))
+    with SessionLocal() as db:
+        total_visitors = db.query(func.count(VisitorIdentity.identity_hash)).scalar() or 0
+        active_users = db.query(func.count(VisitorIdentity.identity_hash)).filter(VisitorIdentity.last_seen >= cutoff).scalar() or 0
+        total = db.query(func.coalesce(func.sum(score_expr()), 0)).filter(School.is_active == 1).scalar() or 0
+        schools_playing = db.query(func.count(School.id)).filter(School.is_active == 1, score_expr() > 0).scalar() or 0
+        recent = db.query(ClickEvent).filter(ClickEvent.created_at >= now - timedelta(seconds=7)).all()
+    bucket = {x: 0 for x in points}
+    for event in recent:
+        sec = int(event.created_at.replace(tzinfo=timezone.utc).timestamp())
+        if sec in bucket:
+            bucket[sec] += int(event.clicks)
+    values = [bucket[x] for x in points]
+    return {
+        "total_visitors": int(total_visitors),
+        "active_users": int(active_users),
+        "total_clicks": int(total),
+        "schools_playing": int(schools_playing),
+        "cps_current": int(values[-1]),
+        "cps_avg_5s": round(sum(values) / 5, 1),
+        "cps_last_5_seconds": values,
+        "click_limit_per_minute": CLICK_LIMIT_PER_MINUTE,
+    }
+
+
+@app.get("/api/about")
+def about():
+    return {
+        "title": "О проекте",
+        "text": setting_value("about_text", ""),
+        "author_title": "СЛОВА АВТОРА",
+        "author_words": setting_value("author_words", AUTHOR_WORDS),
+        "production": "Anton Ljungberg Production",
+        "donation_url": setting_value("donation_url", DONATION_URL),
+        "contact_url": "https://t.me/lapiduser",
+        "contact_text": "Прислать фотографию своей школы → @lapiduser",
+    }
+
+
+@app.get("/api/notice")
+def notice():
+    now = utcnow()
+    with SessionLocal() as db:
+        row = db.query(BroadcastNotice).filter(BroadcastNotice.expires_at > now).order_by(BroadcastNotice.id.desc()).first()
+        if not row:
+            return {"active": False}
+        return {"active": True, "id": row.id, "text": row.text, "created_at": iso_utc(row.created_at), "expires_at": iso_utc(row.expires_at)}
+
+
+@app.post("/api/heartbeat")
+def heartbeat(payload: HeartbeatPayload, request: Request, response: Response):
+    require_same_origin(request)
+    identity, prefix, ua_hash = ensure_identity(request, response)
+    now = utcnow()
+    with SessionLocal() as db:
+        if blocked(db, identity):
+            return {"ok": False}
+        row = db.query(DailyVisitor).filter(DailyVisitor.day == today_key(), DailyVisitor.identity_hash == identity).first()
+        if row:
+            row.last_seen = now
+        else:
+            db.add(DailyVisitor(day=today_key(), identity_hash=identity, last_seen=now))
+        visitor = db.get(VisitorIdentity, identity)
+        if visitor:
+            visitor.last_seen = now
+            visitor.ip_prefix = prefix
+            visitor.user_agent_hash = ua_hash
+        db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/clicks")
+def clicks(payload: ClickPayload, request: Request, response: Response):
+    require_same_origin(request)
+    identity, prefix, ua_hash = ensure_identity(request, response)
+    now = utcnow()
+    current_ua_hash = hashlib.sha256(clean_text(request.headers.get("user-agent", "unknown"), 300).encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(ua_hash, current_ua_hash):
+        raise HTTPException(status_code=403, detail="Проверка запроса не пройдена")
+    suspicious_ua = any(x in request.headers.get("user-agent", "").lower() for x in ("curl/", "python-requests", "wget/", "scrapy/", "httpclient"))
+
+    with SessionLocal() as db:
+        account = user_session_account(db, request.cookies.get(USER_COOKIE))
+        minute_limit, burst_limit, actor_minute_limit, actor_burst_limit = effective_limits(account)
+        cleanup_cutoff = now - timedelta(seconds=EVENT_RETENTION_SECONDS)
+        db.query(ClickEvent).filter(ClickEvent.created_at < cleanup_cutoff).delete(synchronize_session=False)
+        db.query(UsedRequest).filter(UsedRequest.created_at < cleanup_cutoff).delete(synchronize_session=False)
+        target = db.get(School, payload.school_id)
+        if not target or not target.is_active:
+            raise HTTPException(status_code=404, detail="Учебное заведение не найдено")
+        if blocked(db, identity):
+            log_abuse(db, "blocked_identity", identity, prefix, "Click from blocked identity")
+            db.commit()
+            raise HTTPException(status_code=403, detail="Доступ ограничен")
+        if TURNSTILE_ENABLED and not captcha_is_verified(db, identity, now):
+            log_abuse(db, "captcha_required", identity, prefix, "Click without verified Turnstile session")
+            db.commit()
+            raise HTTPException(status_code=403, detail="Пройдите проверку CAPTCHA")
+        if suspicious_ua:
+            log_abuse(db, "suspicious_user_agent", identity, prefix, request.headers.get("user-agent", "")[:300])
+            db.commit()
+            raise HTTPException(status_code=403, detail="Запрос заблокирован")
+
+        usage = db.execute(select(VoterUsage).where(VoterUsage.identity_hash == identity).with_for_update()).scalar_one_or_none()
+        if usage is None:
+            usage = VoterUsage(identity_hash=identity, day=today_key(), clicks=0)
+            db.add(usage)
+            db.flush()
+        used = db.get(UsedRequest, payload.request_id)
+        if used is not None:
+            minute_used = recent_clicks_for_identity(db, identity, now, 60)
+            return {"ok": True, "accepted": 0, "rejected": payload.clicks, "duplicate": True, "remaining": max(0, minute_limit - minute_used), "limit_per_minute": minute_limit, "multiplier": VERIFIED_MULTIPLIER if account and account.is_subscriber else 1}
+
+        minute_used = recent_clicks_for_identity(db, identity, now, 60)
+        actor_minute_used = recent_clicks_for_actor(db, prefix, ua_hash, now, 60)
+        burst = recent_clicks_for_identity(db, identity, now, 5)
+        actor_burst = recent_clicks_for_actor(db, prefix, ua_hash, now, 5)
+        req_count = db.query(func.count(UsedRequest.request_id)).filter(
+            UsedRequest.ip_prefix == prefix,
+            UsedRequest.created_at >= now - timedelta(seconds=60),
+        ).scalar() or 0
+        if req_count >= IP_REQUEST_LIMIT_PER_MINUTE:
+            log_abuse(db, "request_rate_limit", identity, prefix, f"requests={req_count}")
+            db.commit()
+            raise HTTPException(status_code=429, detail="Слишком много запросов")
+
+        ip_usage = db.execute(select(IpDailyUsage).where(IpDailyUsage.ip_prefix == prefix, IpDailyUsage.day == today_key()).with_for_update()).scalar_one_or_none()
+        if ip_usage is None:
+            ip_usage = IpDailyUsage(ip_prefix=prefix, day=today_key(), clicks=0, updated_at=now)
+            db.add(ip_usage)
+            db.flush()
+        if ip_usage.clicks >= IP_DAILY_CLICK_LIMIT:
+            log_abuse(db, "ip_daily_click_limit", identity, prefix, f"ip_limit={IP_DAILY_CLICK_LIMIT};used={ip_usage.clicks}")
+            db.commit()
+            raise HTTPException(status_code=429, detail="Слишком много активности с одной сети")
+
+        capacity = min(
+            minute_limit - minute_used,
+            actor_minute_limit - actor_minute_used,
+            burst_limit - burst,
+            actor_burst_limit - actor_burst,
+            IP_DAILY_CLICK_LIMIT - ip_usage.clicks,
+        )
+        accepted = max(0, min(payload.clicks, capacity))
+        rejected = payload.clicks - accepted
+        if accepted:
+            target.real_clicks += accepted
+            usage.clicks += accepted
+            usage.last_click_at = now
+            ip_usage.clicks += accepted
+            ip_usage.updated_at = now
+            db.add(ClickEvent(school_id=target.id, identity_hash=identity, clicks=accepted, created_at=now))
+            if account:
+                account_school = db.execute(
+                    select(AccountSchoolClick).where(
+                        AccountSchoolClick.account_id == account.id,
+                        AccountSchoolClick.school_id == target.id,
+                    ).with_for_update()
+                ).scalar_one_or_none()
+                if account_school is None:
+                    db.add(AccountSchoolClick(account_id=account.id, school_id=target.id, clicks=accepted, updated_at=now))
+                else:
+                    account_school.clicks += accepted
+                    account_school.updated_at = now
+        db.add(UsedRequest(request_id=payload.request_id, identity_hash=identity, ip_prefix=prefix, created_at=now))
+        if rejected:
+            log_abuse(db, "click_cap", identity, prefix, f"requested={payload.clicks};accepted={accepted};limit={minute_limit}")
+        db.commit()
+        remaining = max(0, minute_limit - minute_used - accepted)
+        return {
+            "ok": True,
+            "accepted": accepted,
+            "rejected": rejected,
+            "remaining": remaining,
+            "limit_per_minute": minute_limit,
+            "multiplier": VERIFIED_MULTIPLIER if account and account.is_subscriber else 1,
+        }
+
+
+# ---------- Accounts ----------
+
+@app.get("/api/account/me")
+def account_me(request: Request):
+    with SessionLocal() as db:
+        account = user_session_account(db, request.cookies.get(USER_COOKIE))
+        if not account:
+            return {"authenticated": False}
+        total_clicks = db.query(func.coalesce(func.sum(AccountSchoolClick.clicks), 0)).filter(AccountSchoolClick.account_id == account.id).scalar() or 0
+        fav_row = db.query(AccountSchoolClick, School).join(School, School.id == AccountSchoolClick.school_id).filter(
+            AccountSchoolClick.account_id == account.id, School.is_active == 1
+        ).order_by(AccountSchoolClick.clicks.desc(), School.name.asc()).first()
+        favorite = None
+        if fav_row:
+            linked, school = fav_row
+            favorite = {"id": school.id, "name": school.name, "city": school.city, "clicks": int(linked.clicks)}
+        return {
+            "authenticated": True,
+            "telegram_username": account.telegram_username,
+            "verified_subscriber": bool(account.is_subscriber),
+            "multiplier": VERIFIED_MULTIPLIER if account.is_subscriber else 1,
+            "total_clicks": int(total_clicks),
+            "favorite_school": favorite,
+        }
+
+
+@app.post("/api/account/verification/start")
+def verification_start(payload: VerificationStartPayload, request: Request):
+    require_same_origin(request)
+    username = normalize_username(payload.telegram_username)
+    if not username:
+        raise HTTPException(status_code=400, detail="Укажите Telegram username")
+    with SessionLocal() as db:
+        if db.query(Account).filter(func.lower(Account.telegram_username) == username).first():
+            raise HTTPException(status_code=409, detail="Этот username уже зарегистрирован. Используйте вход.")
+        now = utcnow()
+        db.query(TelegramVerificationChallenge).filter(
+            TelegramVerificationChallenge.site_username == username,
+            TelegramVerificationChallenge.used_at.is_(None),
+        ).delete(synchronize_session=False)
+        code = telegram_bot.new_code()
+        challenge = TelegramVerificationChallenge(
+            code_hash=telegram_bot.hash_code(code),
+            site_username=username,
+            created_at=now,
+            expires_at=now + timedelta(minutes=BOT_CODE_MINUTES),
+        )
+        db.add(challenge)
+        db.commit()
+        db_url = bot_url()
+    if not db_url:
+        raise HTTPException(status_code=503, detail="Ссылка на Telegram-бота не настроена. Укажите TELEGRAM_BOT_USERNAME или TELEGRAM_BOT_URL.")
+    deep_link = f"{db_url}?start={code}"
+    return {"ok": True, "code": code, "bot_url": deep_link, "expires_at": iso_utc(challenge.expires_at), "username": username}
+
+
+@app.get("/api/account/verification/status")
+def verification_status(code: str):
+    code = code.upper().strip()
+    with SessionLocal() as db:
+        row = db.get(TelegramVerificationChallenge, telegram_bot.hash_code(code))
+        if not row or row.used_at or row.expires_at <= utcnow():
+            return {"approved": False, "expired": True}
+        return {
+            "approved": bool(row.approved_at),
+            "telegram_username": row.telegram_username or "",
+            "site_username": row.site_username,
+            "expires_at": iso_utc(row.expires_at),
+        }
+
+
+@app.post("/api/account/register")
+def account_register(payload: AccountRegisterPayload, request: Request, response: Response):
+    require_same_origin(request)
+    username = normalize_username(payload.telegram_username)
+    code = payload.code.upper().strip()
+    with SessionLocal() as db:
+        verification = db.get(TelegramVerificationChallenge, telegram_bot.hash_code(code))
+        now = utcnow()
+        if not verification or verification.used_at or verification.expires_at <= now:
+            raise HTTPException(status_code=400, detail="Код недействителен или истёк. Сгенерируйте новый код.")
+        if verification.site_username != username:
+            raise HTTPException(status_code=400, detail="Username не совпадает с тем, для которого создан код")
+        if not verification.approved_at or not verification.tg_user_id:
+            raise HTTPException(status_code=400, detail="Сначала отправьте код боту и дождитесь подтверждения")
+        verified_username = normalize_username(verification.telegram_username or "")
+        if verified_username and verified_username != username:
+            raise HTTPException(status_code=400, detail="Telegram username в боте не совпадает с username на сайте")
+        if db.query(Account).filter(Account.tg_user_id == verification.tg_user_id).first():
+            raise HTTPException(status_code=409, detail="Для этого Telegram уже есть аккаунт. Используйте вход.")
+        salt, digest = password_hash(payload.password)
+        if not TELEGRAM_BOT_TOKEN:
+            raise HTTPException(status_code=503, detail="Telegram-бот ещё не настроен на сервере")
+        try:
+            import aiohttp
+            import asyncio
+            async def verify_member():
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as http:
+                    return await telegram_bot.check_subscription(http, int(verification.tg_user_id))
+            subscribed = asyncio.run(verify_member())
+        except Exception:
+            raise HTTPException(status_code=503, detail="Не удалось проверить подписку. Попробуйте ещё раз.")
+        if not subscribed:
+            raise HTTPException(status_code=403, detail="Подпишитесь на канал и получите новое подтверждение через бота")
+        account = Account(
+            tg_user_id=verification.tg_user_id, telegram_username=username, password_salt=salt, password_hash=digest,
+            created_at=now, verified_at=now, is_subscriber=1, last_subscription_check=now,
+        )
+        verification.used_at = now
+        db.add(account)
+        db.flush()
+        token = secrets.token_urlsafe(48)
+        db.add(UserSession(token_hash=hash_token(token), account_id=account.id, created_at=now, expires_at=now + timedelta(days=ACCOUNT_SESSION_DAYS)))
+        db.commit()
+    response.set_cookie(USER_COOKIE, token, max_age=ACCOUNT_SESSION_DAYS * 86400, httponly=True, secure=COOKIE_SECURE, samesite="lax", path="/")
+    return {"ok": True, "telegram_username": username, "verified_subscriber": True, "multiplier": VERIFIED_MULTIPLIER}
+
+
+@app.post("/api/account/login")
+def account_login(payload: AccountLoginPayload, request: Request, response: Response):
+    require_same_origin(request)
+    username = normalize_username(payload.telegram_username)
+    now = utcnow()
+    with SessionLocal() as db:
+        account = db.query(Account).filter(func.lower(Account.telegram_username) == username).first()
+        if not account or not password_ok(payload.password, account.password_salt, account.password_hash):
+            raise HTTPException(status_code=401, detail="Неверный username или пароль")
+        if TELEGRAM_BOT_TOKEN and (not account.last_subscription_check or account.last_subscription_check < now - timedelta(minutes=SUBSCRIPTION_REFRESH_MINUTES)):
+            try:
+                import aiohttp
+                import asyncio
+                async def verify_member():
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as http:
+                        return await telegram_bot.check_subscription(http, int(account.tg_user_id))
+                account.is_subscriber = 1 if asyncio.run(verify_member()) else 0
+                account.last_subscription_check = now
+            except Exception:
+                pass
+        token = secrets.token_urlsafe(48)
+        db.add(UserSession(token_hash=hash_token(token), account_id=account.id, created_at=now, expires_at=now + timedelta(days=ACCOUNT_SESSION_DAYS)))
+        db.commit()
+        multiplier = VERIFIED_MULTIPLIER if account.is_subscriber else 1
+    response.set_cookie(USER_COOKIE, token, max_age=ACCOUNT_SESSION_DAYS * 86400, httponly=True, secure=COOKIE_SECURE, samesite="lax", path="/")
+    return {"ok": True, "verified_subscriber": bool(multiplier == VERIFIED_MULTIPLIER), "multiplier": multiplier}
+
+
+@app.post("/api/account/logout")
+def account_logout(request: Request, response: Response):
+    require_same_origin(request)
+    token = request.cookies.get(USER_COOKIE)
+    if token:
+        with SessionLocal() as db:
+            db.query(UserSession).filter(UserSession.token_hash == hash_token(token)).delete(synchronize_session=False)
+            db.commit()
+    response.delete_cookie(USER_COOKIE, path="/")
+    return {"ok": True}
+
+
+# ---------- Admin ----------
+
+def require_admin(token: str | None):
+    if not token:
+        raise HTTPException(status_code=401, detail="Требуется вход администратора")
+    with SessionLocal() as db:
+        row = db.get(AdminSession, hash_token(token))
+        if not row or row.expires_at <= utcnow():
+            raise HTTPException(status_code=401, detail="Сессия администратора истекла")
+
+
+@app.get("/api/admin/me")
+def admin_me(bitva_admin: str | None = Cookie(default=None)):
+    if not bitva_admin:
+        return {"authenticated": False}
+    try:
+        require_admin(bitva_admin)
+    except HTTPException:
+        return {"authenticated": False}
+    return {"authenticated": True, "username": ADMIN_USERNAME}
+
+
+@app.post("/api/admin/login")
+def admin_login(payload: AdminLoginPayload, request: Request, response: Response):
+    require_same_origin(request)
+    if not ADMIN_PASSWORD:
+        raise HTTPException(status_code=503, detail="ADMIN_PASSWORD не задан на сервере")
+    prefix = ip_prefix(client_ip(request))
+    since = utcnow() - timedelta(minutes=15)
+    with SessionLocal() as db:
+        failed = db.query(func.count(AbuseEvent.id)).filter(AbuseEvent.event_type == "admin_login_failed", AbuseEvent.ip_prefix == prefix, AbuseEvent.created_at >= since).scalar() or 0
+        if failed >= 8:
+            raise HTTPException(status_code=429, detail="Слишком много попыток входа. Попробуйте позже")
+        if TURNSTILE_ENABLED and not verify_turnstile(payload.captcha_token or "", client_ip(request)):
+            log_abuse(db, "admin_invalid_captcha", None, prefix, "admin login captcha failed")
+            db.commit()
+            raise HTTPException(status_code=403, detail="Проверка CAPTCHA не пройдена")
+        if not (hmac.compare_digest(payload.username, ADMIN_USERNAME) and hmac.compare_digest(payload.password, ADMIN_PASSWORD)):
+            log_abuse(db, "admin_login_failed", None, prefix, "invalid credentials")
+            db.commit()
+            raise HTTPException(status_code=401, detail="Неверные данные")
+        token = secrets.token_urlsafe(48)
+        db.add(AdminSession(token_hash=hash_token(token), created_at=utcnow(), expires_at=utcnow() + timedelta(hours=ADMIN_SESSION_HOURS), ip_prefix=prefix))
+        db.commit()
+    response.set_cookie(ADMIN_COOKIE, token, max_age=ADMIN_SESSION_HOURS * 3600, httponly=True, secure=COOKIE_SECURE, samesite="strict", path="/")
+    return {"ok": True}
+
+
+@app.post("/api/admin/logout")
+def admin_logout(response: Response, request: Request, bitva_admin: str | None = Cookie(default=None)):
+    require_same_origin(request)
+    if bitva_admin:
+        with SessionLocal() as db:
+            db.query(AdminSession).filter(AdminSession.token_hash == hash_token(bitva_admin)).delete(synchronize_session=False)
+            db.commit()
+    response.delete_cookie(ADMIN_COOKIE, path="/")
