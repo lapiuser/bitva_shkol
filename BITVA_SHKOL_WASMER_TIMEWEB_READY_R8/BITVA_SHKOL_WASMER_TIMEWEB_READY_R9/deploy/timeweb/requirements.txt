@@ -1,0 +1,9 @@
+fastapi>=0.116,<1
+uvicorn[standard]>=0.35,<1
+SQLAlchemy>=2.0.52,<2.1
+psycopg[binary]>=3.2,<4
+PyMySQL>=1.1,<2
+certifi>=2025.10,<2027
+aiohttp>=3.11,<4
+Pillow>=11,<13
+python-multipart>=0.0.20,<1
